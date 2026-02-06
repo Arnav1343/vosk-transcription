@@ -1,1 +1,2 @@
-vosk>=0.3.45
+vosk
+openai-whisper>=0.3.45

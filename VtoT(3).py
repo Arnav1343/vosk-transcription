@@ -1,21 +1,25 @@
 """
 Hybrid VOSK + Whisper Transcription Agent - VtoT(3).py
-Combines VOSK timing and confidence scores with Whisper semantic accuracy.
+
+Whisper: meaning (text, sentences, timing, language)
+VOSK: speech behavior (word timings, confidence, pauses, speed, fillers)
 
 Output Format:
 {
-    "text": "Whisper transcription with punctuation and capitalization",
+    "whisper": {"text": "...", "language": "en", "sentence_count": 10},
     "sentences": [
-        {"sentence": "Hello, how are you?", "start": 0.0, "end": 2.5, "duration": 2.5}
+        {
+            "text": "Hello, how are you?",
+            "start": 0.0, "end": 2.5,
+            "speech": {
+                "word_timings": [{"word": "hello", "start": 0.0, "end": 0.5, "conf": 0.95}],
+                "speech_speed_wpm": 120,
+                "pauses": [{"after_word": "hello", "duration": 0.3}],
+                "fillers": ["um"], "filler_count": 1
+            }
+        }
     ],
-    "metadata": {
-        "model_whisper": "base",
-        "model_vosk": "vosk-model-small-en-us-0.15",
-        "vosk_confidence": 0.72,
-        "whisper_language": "en",
-        "sentence_count": 10,
-        "status": "SUCCESS"
-    }
+    "status": "SUCCESS"
 }
 """
 import json
@@ -195,48 +199,109 @@ class HybridTranscriptionAgent:
             }
     
     def _combine_results(self, vosk_result: Dict, whisper_result: Dict) -> Dict:
-        """Combine VOSK timing with Whisper semantic text."""
+        """
+        Combine VOSK speech behavior with Whisper semantic meaning.
         
-        # Primary text from Whisper
-        text = whisper_result.get('text', '')
+        Whisper provides: text, sentences, timing, language
+        VOSK provides: word timings, confidence, pauses, speed, fillers
+        """
         
-        # Sentence-level output from Whisper segments
+        # VOSK words for speech behavior analysis
+        vosk_words = vosk_result.get('words', [])
+        
+        # Whisper segments for meaning
         segments = whisper_result.get('segments', [])
+        
+        # Filler words to detect
+        FILLERS = {'uh', 'um', 'er', 'ah', 'like', 'you know', 'basically', 'actually'}
+        
+        # Build sentences with VOSK speech metrics merged in
         sentences = []
         for seg in segments:
-            sentences.append({
-                'sentence': seg.get('text', '').strip(),
-                'start': round(seg.get('start', 0), 2),
-                'end': round(seg.get('end', 0), 2),
-                'duration': round(seg.get('end', 0) - seg.get('start', 0), 2)
-            })
-        
-        # Metadata
-        metadata = {
-            'model_whisper': self.whisper_model_name,
-            'model_vosk': self.vosk_model_name,
-            'vosk_confidence': round(vosk_result.get('avg_confidence', 0), 3),
-            'vosk_word_count': vosk_result.get('word_count', 0),
-            'whisper_language': whisper_result.get('language', 'en'),
-            'sentence_count': len(sentences),
-            'status': 'SUCCESS'
-        }
+            seg_start = seg.get('start', 0)
+            seg_end = seg.get('end', 0)
+            
+            # Find VOSK words within this sentence's time window (strict match, no overlap)
+            words_in_segment = [
+                w for w in vosk_words 
+                if w.get('start', 0) >= seg_start and w.get('end', 0) <= seg_end
+            ]
+            
+            # Calculate speech behavior metrics from VOSK words
+            word_count = len(words_in_segment)
+            
+            # Confidence (average for this sentence)
+            avg_conf = 0
+            if words_in_segment:
+                avg_conf = sum(w.get('conf', 0) for w in words_in_segment) / len(words_in_segment)
+            
+            # Pauses/gaps - just count and total duration
+            pause_count = 0
+            total_pause_duration = 0
+            for i in range(1, len(words_in_segment)):
+                prev_end = words_in_segment[i-1].get('end', 0)
+                curr_start = words_in_segment[i].get('start', 0)
+                gap = curr_start - prev_end
+                if gap > 0.1:  # Only count gaps > 100ms
+                    pause_count += 1
+                    total_pause_duration += gap
+            
+            # Speech speed (words per minute)
+            duration = seg_end - seg_start
+            speech_speed_wpm = round((word_count / duration) * 60, 1) if duration > 0 else 0
+            
+            # Filler count only
+            filler_count = 0
+            for w in words_in_segment:
+                word_lower = w.get('word', '').lower()
+                if word_lower in FILLERS:
+                    filler_count += 1
+            
+            # Build sentence object - summary metrics only
+            sentence_obj = {
+                # From Whisper (meaning)
+                'text': seg.get('text', '').strip(),
+                'start': round(seg_start, 2),
+                'end': round(seg_end, 2),
+                
+                # From VOSK (speech behavior) - summary only
+                'speech': {
+                    'word_count': word_count,
+                    'confidence': round(avg_conf, 3),
+                    'speed_wpm': speech_speed_wpm,
+                    'pause_count': pause_count,
+                    'pause_duration': round(total_pause_duration, 2),
+                    'filler_count': filler_count
+                }
+            }
+            
+            sentences.append(sentence_obj)
         
         # Quality check
+        status = 'SUCCESS'
+        reason = None
+        text = whisper_result.get('text', '')
         if not text:
-            metadata['status'] = 'REJECTED'
-            metadata['reason'] = 'no_whisper_transcription'
+            status = 'REJECTED'
+            reason = 'no_whisper_transcription'
         elif vosk_result.get('word_count', 0) < self.MIN_WORDS_REQUIRED:
-            metadata['status'] = 'REJECTED'
-            metadata['reason'] = 'insufficient_vosk_words'
-        elif vosk_result.get('avg_confidence', 0) < self.MIN_VOSK_CONFIDENCE:
-            metadata['status'] = 'WARNING'
-            metadata['reason'] = 'low_vosk_confidence'
+            status = 'REJECTED'
+            reason = 'insufficient_vosk_words'
         
         return {
-            'text': text,
+            # Whisper: meaning
+            'whisper': {
+                'text': text,
+                'language': whisper_result.get('language', 'en'),
+                'sentence_count': len(sentences)
+            },
+            
+            # Merged: sentences with VOSK speech behavior
             'sentences': sentences,
-            'metadata': metadata
+            
+            # Minimal metadata
+            'status': status,
+            'reason': reason
         }
     
     def transcribe(self, audio_path: str) -> Dict:
@@ -252,12 +317,10 @@ class HybridTranscriptionAgent:
         # Validate input
         if not os.path.exists(audio_path):
             return {
-                'text': '',
-                'words': [],
-                'metadata': {
-                    'status': 'ERROR',
-                    'reason': 'file_not_found'
-                }
+                'whisper': {'text': '', 'language': None, 'sentence_count': 0},
+                'sentences': [],
+                'status': 'ERROR',
+                'reason': 'file_not_found'
             }
         
         print(f"\n[INFO] Processing: {audio_path}", file=sys.stderr)
@@ -273,12 +336,10 @@ class HybridTranscriptionAgent:
         
         if wav_path is None:
             return {
-                'text': '',
-                'words': [],
-                'metadata': {
-                    'status': 'ERROR',
-                    'reason': 'audio_preprocessing_failed'
-                }
+                'whisper': {'text': '', 'language': None, 'sentence_count': 0},
+                'sentences': [],
+                'status': 'ERROR',
+                'reason': 'audio_preprocessing_failed'
             }
         
         try:
@@ -299,7 +360,7 @@ class HybridTranscriptionAgent:
             combined = self._combine_results(vosk_result, whisper_result)
             
             print(f"[OK] Transcription complete", file=sys.stderr)
-            print(f"[INFO] Status: {combined['metadata']['status']}", file=sys.stderr)
+            print(f"[INFO] Status: {combined['status']}", file=sys.stderr)
             
             return combined
             
@@ -335,12 +396,10 @@ def main():
     """Main entry point."""
     if len(sys.argv) < 2:
         print(json.dumps({
-            'text': '',
-            'words': [],
-            'metadata': {
-                'status': 'ERROR',
-                'reason': 'no_input_file'
-            }
+            'whisper': {'text': '', 'language': None, 'sentence_count': 0},
+            'sentences': [],
+            'status': 'ERROR',
+            'reason': 'no_input_file'
         }, indent=2))
         sys.exit(1)
     
@@ -350,12 +409,10 @@ def main():
     vosk_model_path = find_vosk_model()
     if not vosk_model_path:
         print(json.dumps({
-            'text': '',
-            'words': [],
-            'metadata': {
-                'status': 'ERROR',
-                'reason': 'vosk_model_not_found'
-            }
+            'whisper': {'text': '', 'language': None, 'sentence_count': 0},
+            'sentences': [],
+            'status': 'ERROR',
+            'reason': 'vosk_model_not_found'
         }, indent=2))
         sys.exit(1)
     
@@ -368,7 +425,7 @@ def main():
         print(json.dumps(result, indent=2))
         
         # Exit code based on status
-        status = result['metadata'].get('status', 'ERROR')
+        status = result.get('status', 'ERROR')
         if status == 'SUCCESS':
             sys.exit(0)
         elif status == 'WARNING':
@@ -378,13 +435,11 @@ def main():
     
     except Exception as e:
         print(json.dumps({
-            'text': '',
-            'words': [],
-            'metadata': {
-                'status': 'ERROR',
-                'reason': 'initialization_error',
-                'error': str(e)
-            }
+            'whisper': {'text': '', 'language': None, 'sentence_count': 0},
+            'sentences': [],
+            'status': 'ERROR',
+            'reason': 'initialization_error',
+            'error': str(e)
         }, indent=2))
         sys.exit(1)
 
